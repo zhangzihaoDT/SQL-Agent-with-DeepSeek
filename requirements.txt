@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+langchain-community
+gradio
+python-dotenv
+sqlalchemy
+langsmith

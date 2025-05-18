@@ -1,0 +1,20 @@
+# 忽略环境变量文件
+.env
+
+# 忽略 Python 虚拟环境文件夹
+venv/
+
+# 忽略 Python 缓存文件和文件夹
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略 SQLite 数据库文件 (如果它是由应用动态生成的且不应纳入版本控制)
+*.db
+*.sqlite
+*.sqlite3
+
+# 忽略 IDE 和操作系统生成的文件
+.DS_Store
+.idea/
+.vscode/
