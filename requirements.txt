@@ -1,7 +1,10 @@
-langchain
-langchain-openai
-langchain-community
-gradio
-python-dotenv
-sqlalchemy
-langsmith
+langchain==0.3.25
+langchain-openai==0.3.17
+langchain-community==0.3.24
+gradio==4.44.1
+python-dotenv==1.1.0
+sqlalchemy==2.0.41
+langsmith==0.3.42
+duckdb==1.2.2
+duckdb_engine==0.17.0
+langgraph==0.4.5
