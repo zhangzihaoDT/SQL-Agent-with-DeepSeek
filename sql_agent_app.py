@@ -1,6 +1,13 @@
 import os
 import gradio as gr
 import sqlite3
+import duckdb  # 添加 DuckDB 导入
+import sqlalchemy  # 添加 SQLAlchemy 导入
+from sqlalchemy import inspect, MetaData, Table  # 导入可能需要的特定功能
+# 关闭警告 ：如果索引反射警告不重要，可以禁用它：
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="duckdb_engine")
+
 from dotenv import load_dotenv
 import time
 import json
@@ -19,7 +26,14 @@ from langgraph.graph import StateGraph, END
 
 # --- 配置 ---
 ENV_PATH = "/Users/zihao_/Documents/coding/Langchain_chatwithdata/W20方向/.env"
-DB_FILE = "chinook_agent.db"  # 将在脚本所在目录创建
+# 更新数据库文件路径
+DB_FILE = "/Users/zihao_/Documents/coding/Langchain_chatwithdata/database/central_analytics.duckdb"
+
+# --- 初始化 Agent ---
+# 全局变量存储表结构信息
+_TABLE_STRUCTURE = {}
+# 全局数据库连接
+_DB_CONNECTION = None
 
 # --- 加载环境变量并配置 LangSmith ---
 load_dotenv(dotenv_path=ENV_PATH)
@@ -61,45 +75,17 @@ def get_llm():
     )
 
 # --- 数据库设置 ---
-def setup_database(db_file=DB_FILE):
-    db_path = os.path.join(os.path.dirname(__file__), db_file)  # 将数据库放在脚本旁边
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def setup_database(db_file=DB_FILE, verbose=False):
+    # 使用正确的 SQLAlchemy URI 格式
+    # 对于 DuckDB，格式应该是 "duckdb:///:memory:" 或 "duckdb:///path/to/file"
+    if verbose:
+        if os.path.exists(db_file):
+            print(f"连接到现有数据库: {db_file}")
+        else:
+            print(f"警告: 数据库文件 '{db_file}' 不存在!")
     
-    # 创建一个简单的表（例如来自 Chinook 示例的 Employees 表）
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Employees (
-            EmployeeId INTEGER PRIMARY KEY,
-            LastName TEXT,
-            FirstName TEXT,
-            Title TEXT,
-            ReportsTo INTEGER,
-            BirthDate TEXT,
-            HireDate TEXT,
-            Address TEXT,
-            City TEXT,
-            State TEXT,
-            Country TEXT,
-            PostalCode TEXT,
-            Phone TEXT,
-            Fax TEXT,
-            Email TEXT
-        )
-    ''')
-    # 如果表为空，则添加一些示例数据
-    cursor.execute("SELECT COUNT(*) FROM Employees")
-    if cursor.fetchone()[0] == 0:
-        sample_data = [
-            (1, 'Adams', 'Andrew', 'General Manager', None, '1962-02-18', '2002-08-14', '11120 Jasper Ave NW', 'Edmonton', 'AB', 'Canada', 'T5K 2N1', '+1 (780) 428-9482', '+1 (780) 428-3457', 'andrew@chinookcorp.com'),
-            (2, 'Edwards', 'Nancy', 'Sales Manager', 1, '1958-12-08', '2002-05-01', '825 8 Ave SW', 'Calgary', 'AB', 'Canada', 'T2P 2T3', '+1 (403) 262-3443', '+1 (403) 262-3322', 'nancy@chinookcorp.com'),
-            (3, 'Peacock', 'Jane', 'Sales Support Agent', 2, '1973-08-29', '2002-04-01', '1111 6 Ave SW', 'Calgary', 'AB', 'Canada', 'T2P 5M5', '+1 (403) 262-3443', '+1 (403) 262-6712', 'jane@chinookcorp.com')
-        ]
-        cursor.executemany("INSERT INTO Employees VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", sample_data)
-        print(f"已向 {db_file} 插入示例数据。")
-    
-    conn.commit()
-    conn.close()
-    return f"sqlite:///{db_path}"
+    # 注意这里使用三个斜杠，这是 SQLAlchemy 的要求
+    return f"duckdb:///{db_file}"
 
 # --- 重构的 LangGraph Agent 实现 ---
 
@@ -132,12 +118,27 @@ INTENT_RECOGNITION_PROMPT = """你是一个专业的数据库分析助手。请�
 
 SQL_GENERATION_PROMPT = """你是一个 SQL 专家。根据用户的问题生成适当的 SQL 查询。
 
+数据库是 DuckDB，它与 PostgreSQL 语法兼容，但有一些特殊功能。
+
 数据库结构信息:
 {schema}
 
 用户问题: {question}
 
-请生成一个能够回答用户问题的 SQL 查询。只返回 SQL 查询语句，不要有任何其他解释。
+请注意以下几点：
+1. 必须使用上面提供的数据库结构中实际存在的表名和列名
+2. 表名和列名可能包含中文或特殊字符，请使用双引号将它们括起来
+3. 日期处理指南:
+   - 对于日期列，注意区分"日期 年"和"日期 月"等特殊命名的列
+   - 使用 EXTRACT(YEAR FROM "日期 年") 提取年份
+   - 使用 EXTRACT(MONTH FROM "日期 年") 提取月份
+   - 日期比较可以使用 "日期 年" >= '2024-01-01' AND "日期 年" < '2025-01-01'
+4. 不要使用 Markdown 格式（如 ```sql）包装你的查询
+5. 确保查询语法与 DuckDB 兼容
+6. 如果查询涉及多个表，请确保表之间的关系正确
+7. 销量数据可能存储在"量"列中，而不是"销量"列
+
+只返回 SQL 查询语句，不要有任何其他解释或格式标记。
 """
 
 ANSWER_GENERATION_PROMPT = """你是一个数据库分析助手。根据 SQL 查询结果回答用户的问题。
@@ -169,11 +170,19 @@ def identify_intent(state: AgentState) -> AgentState:
         "intent": intent
     }
 
+def get_db_connection(verbose=False):
+    """获取数据库连接（单例模式）"""
+    global _DB_CONNECTION
+    if _DB_CONNECTION is None:
+        db_uri = setup_database(verbose=verbose)
+        _DB_CONNECTION = SQLDatabase.from_uri(db_uri)
+        if verbose:
+            print("创建了新的数据库连接")
+    return _DB_CONNECTION
+
 def get_database_schema(state: AgentState) -> AgentState:
     """获取数据库模式"""
-    db_uri = setup_database()
-    db = SQLDatabase.from_uri(db_uri)
-    
+    db = get_db_connection()
     schema = db.get_table_info()
     
     thoughts = state.get("thoughts", [])
@@ -189,7 +198,47 @@ def generate_sql_query(state: AgentState) -> AgentState:
     """生成 SQL 查询"""
     llm = get_llm()
     
-    sql_chain = ChatPromptTemplate.from_template(SQL_GENERATION_PROMPT) | llm | StrOutputParser()
+    # 获取表结构信息
+    global _TABLE_STRUCTURE
+    
+    # 格式化表结构信息
+    table_structure_text = ""
+    for table, columns in _TABLE_STRUCTURE.items():
+        table_structure_text += f'表 "{table}" 的列:\n'
+        for col in columns:
+            table_structure_text += f'  - "{col["name"]}" ({col["type"]})\n'
+        table_structure_text += "\n"
+    
+    # 增强 SQL 生成提示
+    enhanced_prompt = f"""你是一个 SQL 专家。根据用户的问题生成适当的 SQL 查询。
+
+数据库是 DuckDB，它与 PostgreSQL 语法兼容，但有一些特殊功能。
+
+数据库结构信息:
+{state.get("schema", "")}
+
+详细的表结构信息:
+{table_structure_text}
+
+用户问题: {state["question"]}
+
+请注意以下几点：
+1. 必须使用上面提供的数据库结构中实际存在的表名和列名
+2. 表名和列名可能包含中文或特殊字符，请使用双引号将它们括起来
+3. 日期处理指南:
+   - 对于日期列，注意区分"日期 年"和"日期 月"等特殊命名的列
+   - 使用 EXTRACT(YEAR FROM "日期 年") 提取年份
+   - 使用 EXTRACT(MONTH FROM "日期 年") 提取月份
+   - 日期比较可以使用 "日期 年" >= '2024-01-01' AND "日期 年" < '2025-01-01'
+4. 不要使用 Markdown 格式（如 ```sql）包装你的查询
+5. 确保查询语法与 DuckDB 兼容
+6. 如果查询涉及多个表，请确保表之间的关系正确
+7. 销量数据可能存储在"量"列中，而不是"销量"列
+
+只返回 SQL 查询语句，不要有任何其他解释或格式标记。
+"""
+    
+    sql_chain = ChatPromptTemplate.from_template(enhanced_prompt) | llm | StrOutputParser()
     
     raw_sql_query = sql_chain.invoke({
         "schema": state.get("schema", ""),
@@ -215,21 +264,175 @@ def generate_sql_query(state: AgentState) -> AgentState:
         "sql_query": sql_query
     }
 
+def validate_sql_query(state: AgentState) -> AgentState:
+    """验证 SQL 查询"""
+    llm = get_llm()
+    
+    # 获取数据库中实际存在的表名列表和列名信息
+    db = get_db_connection()
+    actual_tables = db.get_usable_table_names()
+    
+    # 获取每个表的列信息
+    table_columns = {}
+    for table in actual_tables:
+        try:
+            # 使用全局表结构信息
+            global _TABLE_STRUCTURE
+            if table in _TABLE_STRUCTURE:
+                table_columns[table] = [col["name"] for col in _TABLE_STRUCTURE[table]]
+            else:
+                # 如果全局表结构中没有，尝试直接查询
+                columns_query = f'DESCRIBE "{table}"'
+                columns_result = db.run(columns_query)
+                # 提取列名
+                column_names = []
+                for line in columns_result.strip().split('\n'):
+                    if line and '|' in line:
+                        # 第一列通常是列名
+                        column_name = line.split('|')[0].strip()
+                        if column_name and column_name != "column_name" and not column_name.startswith('-'):
+                            column_names.append(column_name)
+                table_columns[table] = column_names
+        except Exception as e:
+            print(f"获取表 {table} 的列信息时出错: {e}")
+    
+    validation_prompt = """你是一个 SQL 专家。请验证以下 SQL 查询是否有效，并修复任何问题。
+
+数据库是 DuckDB，它与 PostgreSQL 语法兼容。
+
+数据库结构信息:
+{schema}
+
+数据库中实际存在的表:
+{actual_tables}
+
+每个表的列信息:
+{table_columns}
+
+原始 SQL 查询:
+{sql_query}
+
+请检查以下问题：
+1. 表名必须是数据库中实际存在的表，不要使用不存在的表名
+2. 列名必须是表中实际存在的列，不要使用不存在的列名
+3. 表名和列名是否正确引用（特别是包含中文或特殊字符的名称）
+4. SQL 语法是否正确
+5. 查询是否与数据库结构匹配
+6. 日期类型的列处理是否正确，特别是"日期 年"和"日期 月"等特殊命名的列
+
+只返回修复后的 SQL 查询，不要有任何其他解释或格式标记。如果原始查询已经正确，则直接返回原始查询。
+"""
+    
+    # 格式化表列信息为易读的文本
+    table_columns_text = ""
+    for table, columns in table_columns.items():
+        quoted_columns = [f'"{col}"' for col in columns]
+        table_columns_text += f'表 "{table}" 的列: {", ".join(quoted_columns)}\n'
+    
+    validation_chain = ChatPromptTemplate.from_template(validation_prompt) | llm | StrOutputParser()
+    
+    validated_sql = validation_chain.invoke({
+        "schema": state.get("schema", ""),
+        "actual_tables": ", ".join([f'"{table}"' for table in actual_tables]),
+        "table_columns": table_columns_text,
+        "sql_query": state.get("sql_query", "")
+    }).strip()
+    
+    # 清理验证后的 SQL
+    if "```" in validated_sql:
+        validated_sql = validated_sql.replace("```sql", "").replace("```", "").strip()
+    
+    # 确保返回的是有效的 SQL 查询，而不是解释文本
+    if validated_sql.lower().startswith("select") or validated_sql.lower().startswith("with") or validated_sql.lower().startswith("update") or validated_sql.lower().startswith("delete") or validated_sql.lower().startswith("insert"):
+        # 这是一个有效的 SQL 查询
+        thoughts = state.get("thoughts", [])
+        if validated_sql != state.get("sql_query", ""):
+            thoughts.append(f"SQL 查询已修正: {validated_sql}")
+        else:
+            thoughts.append("SQL 查询验证通过，无需修改")
+        
+        return {
+            **state,
+            "thoughts": thoughts,
+            "sql_query": validated_sql
+        }
+    else:
+        # 返回原始查询，因为验证结果不是有效的 SQL
+        thoughts = state.get("thoughts", [])
+        thoughts.append("验证结果不是有效的 SQL 查询，使用原始查询")
+        
+        return {
+            **state,
+            "thoughts": thoughts,
+            "sql_query": state.get("sql_query", "")
+        }
+
+# 创建 SQL Agent
+def create_sql_agent():
+    """创建 SQL Agent 工作流"""
+    # 创建状态图
+    workflow = StateGraph(AgentState)
+    
+    # 添加节点
+    workflow.add_node("identify_intent", identify_intent)
+    workflow.add_node("get_schema", get_database_schema)
+    workflow.add_node("generate_sql", generate_sql_query)
+    workflow.add_node("validate_sql", validate_sql_query)  # 新增验证节点
+    workflow.add_node("execute_sql", execute_sql_query)
+    workflow.add_node("generate_answer", generate_answer)
+    workflow.add_node("direct_schema", direct_schema_response)
+    
+    # 设置入口点
+    workflow.set_entry_point("identify_intent")
+    
+    # 添加边
+    workflow.add_conditional_edges(
+        "identify_intent",
+        route_by_intent,
+        {
+            "direct_schema": "direct_schema",
+            "query_flow": "get_schema"
+        }
+    )
+    
+    workflow.add_edge("get_schema", "generate_sql")
+    workflow.add_edge("generate_sql", "validate_sql")  # 添加到验证节点的边
+    workflow.add_edge("validate_sql", "execute_sql")   # 从验证节点到执行节点的边
+    workflow.add_edge("execute_sql", "generate_answer")
+    
+    # 设置终止节点
+    workflow.add_edge("direct_schema", END)
+    workflow.add_edge("generate_answer", END)
+    
+    # 编译工作流
+    return workflow.compile()
+
 def execute_sql_query(state: AgentState) -> AgentState:
     """执行 SQL 查询"""
-    db_uri = setup_database()
-    db = SQLDatabase.from_uri(db_uri)
+    # 使用连接池而不是创建新连接
+    db = get_db_connection()
     
     try:
-        # 确保 SQL 查询是干净的
+        # 更彻底地清理 SQL 查询
         sql_query = state["sql_query"].strip()
-        # 移除可能的 Markdown 代码块标记
-        if "```" in sql_query:
-            sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
         
+        # 移除所有可能的 Markdown 代码块标记和其他非 SQL 内容
+        if "```" in sql_query:
+            # 提取 ``` 之间的内容
+            import re
+            code_blocks = re.findall(r'```(?:sql)?(.*?)```', sql_query, re.DOTALL)
+            if code_blocks:
+                sql_query = code_blocks[0].strip()
+            else:
+                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+        
+        # 确保表名和列名中的中文或特殊字符被正确引用
+        thoughts = state.get("thoughts", [])
+        thoughts.append(f"清理后的 SQL 查询: {sql_query}")
+        
+        # 执行查询
         sql_result = db.run(sql_query)
         
-        thoughts = state.get("thoughts", [])
         thoughts.append("成功执行 SQL 查询")
         
         return {
@@ -240,12 +443,75 @@ def execute_sql_query(state: AgentState) -> AgentState:
         }
     except Exception as e:
         thoughts = state.get("thoughts", [])
-        thoughts.append(f"SQL 查询执行错误: {str(e)}")
+        error_msg = str(e)
+        thoughts.append(f"SQL 查询执行错误: {error_msg}")
+        
+        # 提供更详细的错误信息和可能的解决方案
+        error_analysis = "未知错误"
+        suggested_fix = ""
+        
+        if "syntax error" in error_msg.lower():
+            error_analysis = "SQL 语法错误，请检查查询语法"
+        elif "no such table" in error_msg.lower():
+            # 提取错误中提到的表名
+            match = re.search(r'Table with name (.*?) does not exist', error_msg)
+            if match:
+                wrong_table = match.group(1)
+                # 获取可能的替代表
+                actual_tables = db.get_usable_table_names()
+                suggested_tables = []
+                for table in actual_tables:
+                    if wrong_table.lower() in table.lower():
+                        suggested_tables.append(table)
+                
+                if suggested_tables:
+                    suggested_fix = f"可能的替代表: {', '.join(suggested_tables)}"
+                
+            error_analysis = "表不存在，请检查表名是否正确（注意表名可能包含中文或特殊字符）"
+        elif "no such column" in error_msg.lower() or "column" in error_msg.lower() and "does not exist" in error_msg.lower() or "not found in FROM clause" in error_msg.lower():
+            # 提取错误中提到的列名和表名
+            col_match = re.search(r'column ["\']?(.*?)["\']? does not exist|Referenced column ["\']?(.*?)["\']? not found', error_msg)
+            table_match = re.search(r'FROM ["\']?(.*?)["\']?', sql_query)
+            
+            if col_match:
+                wrong_col = col_match.group(1) or col_match.group(2)
+                if table_match:
+                    table_name = table_match.group(1)
+                    # 获取表的列信息
+                    try:
+                        columns_query = f'DESCRIBE "{table_name}"'
+                        columns_result = db.run(columns_query)
+                        # 提取列名
+                        column_names = []
+                        for line in columns_result.strip().split('\n'):
+                            if line and '|' in line:
+                                column_name = line.split('|')[0].strip()
+                                if column_name and column_name != "column_name" and not column_name.startswith('-'):
+                                    column_names.append(column_name)
+                        
+                        # 找出相似的列名
+                        similar_cols = []
+                        for col in column_names:
+                            if wrong_col.lower() in col.lower() or col.lower() in wrong_col.lower():
+                                similar_cols.append(col)
+                        
+                        if similar_cols:
+                            suggested_fix = f"表 '{table_name}' 中可能的替代列: {', '.join(similar_cols)}"
+                        else:
+                            suggested_fix = f"表 '{table_name}' 的所有列: {', '.join(column_names)}"
+                    except Exception as col_err:
+                        print(f"获取列信息时出错: {col_err}")
+            
+            error_analysis = "列不存在，请检查列名是否正确（注意列名可能包含中文或特殊字符）"
+        
+        error_message = f"SQL 查询执行错误: {error_msg}\n可能的原因: {error_analysis}"
+        if suggested_fix:
+            error_message += f"\n{suggested_fix}"
         
         return {
             **state,
             "thoughts": thoughts,
-            "error": f"SQL 查询执行错误: {str(e)}"
+            "error": error_message
         }
 
 def generate_answer(state: AgentState) -> AgentState:
@@ -278,8 +544,8 @@ def generate_answer(state: AgentState) -> AgentState:
 
 def direct_schema_response(state: AgentState) -> AgentState:
     """直接返回数据库模式信息"""
-    db_uri = setup_database()
-    db = SQLDatabase.from_uri(db_uri)
+    # 使用连接池而不是创建新连接
+    db = get_db_connection()
     
     schema = db.get_table_info()
     
@@ -305,51 +571,48 @@ def route_by_intent(state: AgentState) -> str:
     else:  # GET_INFO 或其他
         return "query_flow"  # 默认走查询流程
 
-# 创建 SQL Agent
-def create_sql_agent():
-    """创建 SQL Agent 工作流"""
-    # 创建状态图
-    workflow = StateGraph(AgentState)
+def analyze_database_structure(verbose=False):
+    """分析数据库结构，提取表和列信息"""
+    global _TABLE_STRUCTURE
     
-    # 添加节点
-    workflow.add_node("identify_intent", identify_intent)
-    workflow.add_node("get_schema", get_database_schema)
-    workflow.add_node("generate_sql", generate_sql_query)
-    workflow.add_node("execute_sql", execute_sql_query)
-    workflow.add_node("generate_answer", generate_answer)
-    workflow.add_node("direct_schema", direct_schema_response)
+    if _TABLE_STRUCTURE:
+        return _TABLE_STRUCTURE
     
-    # 设置入口点
-    workflow.set_entry_point("identify_intent")
+    db = get_db_connection(verbose)
+    tables = db.get_usable_table_names()
+    _TABLE_STRUCTURE = {}
     
-    # 添加边
-    workflow.add_conditional_edges(
-        "identify_intent",
-        route_by_intent,
-        {
-            "direct_schema": "direct_schema",
-            "query_flow": "get_schema"
-        }
-    )
+    # 直接使用 SQLAlchemy 的反射功能获取表结构
+    engine = db._engine
+    inspector = sqlalchemy.inspect(engine)
     
-    workflow.add_edge("get_schema", "generate_sql")
-    workflow.add_edge("generate_sql", "execute_sql")
-    workflow.add_edge("execute_sql", "generate_answer")
+    for table in tables:
+        try:
+            columns = inspector.get_columns(table)
+            _TABLE_STRUCTURE[table] = [{"name": col["name"], "type": str(col["type"])} for col in columns]
+            
+            if verbose:
+                print(f"分析表 '{table}': 找到 {len(_TABLE_STRUCTURE[table])} 列")
+                if _TABLE_STRUCTURE[table]:
+                    print(f"列名示例: {', '.join([col['name'] for col in _TABLE_STRUCTURE[table][:3]])}")
+        except Exception as e:
+            if verbose:
+                print(f"分析表 '{table}' 结构时出错: {str(e)}")
     
-    # 设置终止节点
-    workflow.add_edge("direct_schema", END)
-    workflow.add_edge("generate_answer", END)
-    
-    # 编译工作流
-    return workflow.compile()
+    return _TABLE_STRUCTURE
 
-# --- 初始化 Agent ---
+# 在 Agent 初始化时调用
 try:
+    # 分析数据库结构
+    table_structure = analyze_database_structure(verbose=True)
+    print(f"成功分析了 {len(table_structure)} 个表的结构")
+    
     agent_executor = create_sql_agent()
     print("SQL Agent 使用 LangGraph 初始化成功。")
 except Exception as e:
     print(f"初始化期间出错: {e}")
     agent_executor = None
+    table_structure = {}
 
 # --- Gradio 交互函数 ---
 def query_agent(message: str, history: list):
@@ -435,13 +698,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
         # SQL 查询助手 (基于 LangGraph 和 DeepSeek)
-        使用 LangGraph 和 DeepSeek 模型查询 SQLite 数据库 (Employees 表示例)。
+        使用 LangGraph 和 DeepSeek 模型查询 DuckDB 数据库。
         """
     )
     gr.Markdown(
         f"""
         LLM 配置从 '{os.path.basename(ENV_PATH)}' 加载。
-        数据库文件: '{DB_FILE}'。
+        数据库文件: '{os.path.basename(DB_FILE)}'。
         Agent 会显示最终答案以及可折叠的 SQL 查询和中间步骤。
         """
     )
@@ -449,11 +712,15 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     chat_interface = gr.ChatInterface(
         fn=query_agent,
         examples=[ 
-            "描述 Employees 表",
-            "加拿大有多少员工？",
-            "卡尔加里的员工有哪些？",
-            "列出所有员工",
-            "Employees 表中有哪些不同的国家？"
+            "描述数据库中的表",
+            "数据库中有哪些表？",
+            '显示"上险数_03_data_截止 202504_clean"表中的前5条记录',
+            "统计2024年不同品牌的车型数量",
+            "2024年不同燃料类型车型数量是多少？",
+            "2024年不同燃料类型车型数量是多少？从价格配置表中查询。",
+            "2024年哪个城市级别的销量最高？",
+            "智己2024年销量如何？",
+            "智己LS62024年月度销量走势？",
         ],
         chatbot=gr.Chatbot(height=500, show_copy_button=True), 
         textbox=gr.Textbox(placeholder="请输入您关于数据库的问题...", container=False, scale=7),
