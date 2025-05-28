@@ -746,38 +746,51 @@ def query_agent(message: str, history: list):
 # --- Gradio 界面 ---
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(
-        """
-        # SQL 查询助手 (基于 LangGraph 和 DeepSeek)
-        使用 LangGraph 和 DeepSeek 模型查询 DuckDB 数据库。
-        """
-    )
-    gr.Markdown(
-        f"""
-        LLM 配置从 '{os.path.basename(ENV_PATH)}' 加载。
-        数据库文件: '{os.path.basename(DB_FILE)}'。
-        Agent 会显示最终答案以及可折叠的 SQL 查询和中间步骤。
-        """
-    )
-    
-    chat_interface = gr.ChatInterface(
-        fn=query_agent,
-        examples=[ 
-            "数据库中有哪些表？",
-            '显示"上险数_03_data_截止 202504_clean"表中的前5条记录',
-            "智己2024年销量如何？",
-            "智己LS62024年月度销量走势？",
-            "新能源市场月度渗透率走势",
-            "2024年不同燃料类型车型数量是多少？",
-            "2024年不同燃料类型车型数量是多少？从价格配置表中查询。",
-            "在价格配置表中找出2024年20-25万增程（REEV）suv销量前十车型",
-            "2024年哪个城市级别的销量最高？",
-            "对比蔚来ET5 和智己L6用户年龄百分比分布",
-        ],
-        chatbot=gr.Chatbot(height=500, show_copy_button=True), 
-        textbox=gr.Textbox(placeholder="请输入您关于数据库的问题...", container=False, scale=7),
-        retry_btn="🔄 重试",
-        undo_btn="↩️ 撤销",
-        clear_btn="🗑️ 清除对话",
+            """
+            # SQL 查询助手 (基于 LangGraph 和 DeepSeek)
+            使用 LangGraph 构建的代理，结合 DeepSeek 和 GLM-4 模型，通过自然语言与 DuckDB 数据库进行交互。
+            """
+        )
+    with gr.Tab("项目简介"):
+        gr.Markdown(
+            f"""
+            ### 功能特性
+            - **自然语言查询**: 用户可以使用自然语言提问，系统会自动将其转换为 SQL 查询。
+            - **多模型支持**: 意图识别和答案生成使用 GLM-4 模型，SQL 生成和验证使用 DeepSeek 模型。
+            - **SQL 验证与修复**: 生成的 SQL 查询会经过验证和可能的修复，以提高查询成功率。
+            - **详细的思考过程**: Agent 会展示其思考步骤、生成的 SQL 查询以及查询结果，方便用户理解和调试。
+            - **对话历史支持**: (当前版本代码中未明确实现，但 LangGraph 结构支持扩展)
+            - **可配置性**: 通过 `.env` 文件轻松配置 API 密钥和模型端点。
+            - **LangSmith 集成**: 可选的 LangSmith 集成，用于跟踪和调试 Agent 的运行过程。
+
+            ### 当前配置
+            - 📁 **数据库**: `{os.path.basename(DB_FILE)}` (DuckDB)
+            - 🤖 **SQL模型**: `DeepSeek` (通过 VolcEngine Ark 访问, 模型 ID: `{os.getenv('deepseek0324', '未配置')}`)
+            - 🧠 **分析模型**: `GLM-4-Flash` (用于意图识别和答案生成, 模型 ID: `GLM-4-Flash-250414`)
+            - ⚙️ **配置文件**: `{os.path.basename(ENV_PATH)}`
+            """
+        )
+
+    with gr.Tab("查询访问"):
+        chat_interface = gr.ChatInterface(
+            fn=query_agent,
+            examples=[ 
+                "数据库中有哪些表？",
+                '显示"上险数_03_data_截止 202504_clean"表中的前5条记录',
+                "智己2024年销量如何？",
+                "智己LS62024年月度销量走势？",
+                "新能源市场月度渗透率走势",
+                "2024年不同燃料类型车型数量是多少？",
+                "2024年不同燃料类型车型数量是多少？从价格配置表中查询。",
+                "在价格配置表中找出2024年20-25万增程（REEV）suv销量前十车型",
+                "2024年哪个城市级别的销量最高？",
+                "对比蔚来ET5 和智己L6用户年龄百分比分布",
+            ],
+            chatbot=gr.Chatbot(height=450, show_copy_button=True), 
+            textbox=gr.Textbox(placeholder="请输入您关于数据库的问题...", container=False, scale=7),
+            retry_btn="🔄 重试",
+            undo_btn="↩️ 撤销",
+            clear_btn="🗑️ 清除对话",
     )
 
 if __name__ == "__main__":
