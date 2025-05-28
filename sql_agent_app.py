@@ -1,3 +1,4 @@
+# 在文件开头的导入部分添加
 import os
 import gradio as gr
 import sqlite3
@@ -11,6 +12,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="duckdb_engine")
 from dotenv import load_dotenv
 import time
 import json
+import re  # 确保导入re模块用于正则表达式
 from typing import Dict, List, Tuple, Any, Optional, TypedDict, Union, Literal
 
 from langchain_openai import ChatOpenAI
@@ -55,24 +57,49 @@ def configure_langsmith():
 configure_langsmith()
 
 # --- LLM 初始化 ---
-def get_llm():
-    ark_api_key = os.getenv("ARK_API_KEY")
-    # 从 .env 文件获取 DeepSeek0324 的模型名称/端点 ID
-    model_name_from_env = os.getenv("deepseek0324") 
+def get_llm(model_type="deepseek"):
+    """获取LLM模型，支持多模型架构
+    
+    Args:
+        model_type: 模型类型，可选值："deepseek"或"glm4"
+    
+    Returns:
+        ChatOpenAI: 配置好的LLM模型实例
+    """
+    if model_type == "deepseek":
+        # DeepSeek模型配置
+        ark_api_key = os.getenv("ARK_API_KEY")
+        # 从 .env 文件获取 DeepSeek0324 的模型名称/端点 ID
+        model_name_from_env = os.getenv("deepseek0324") 
 
-    if not ark_api_key:
-        raise ValueError("必须在 .env 文件中设置 ARK_API_KEY。")
-    if not model_name_from_env:
-        # 如果在 .env 中找不到 deepseek0324 的回退或错误
-        print("警告: 在 .env 中找不到 'deepseek0324'，使用默认值 'Deepseek-V3'。这可能不是您想要的。")
-        model_name_from_env = "Deepseek-V3"  # 通用回退，如果端点 ID 是必需的，则可能不起作用
+        if not ark_api_key:
+            raise ValueError("必须在 .env 文件中设置 ARK_API_KEY。")
+        if not model_name_from_env:
+            # 如果在 .env 中找不到 deepseek0324 的回退或错误
+            print("警告: 在 .env 中找不到 'deepseek0324'，使用默认值 'Deepseek-V3'。这可能不是您想要的。")
+            model_name_from_env = "Deepseek-V3"  # 通用回退，如果端点 ID 是必需的，则可能不起作用
 
-    return ChatOpenAI(
-        openai_api_key=ark_api_key,
-        openai_api_base="https://ark.cn-beijing.volces.com/api/v3",  # 标准 VolcEngine Ark 基础 URL
-        model_name=model_name_from_env,  # 使用 .env 中的值
-        temperature=0
-    )
+        return ChatOpenAI(
+            openai_api_key=ark_api_key,
+            openai_api_base="https://ark.cn-beijing.volces.com/api/v3",  # 标准 VolcEngine Ark 基础 URL
+            model_name=model_name_from_env,  # 使用 .env 中的值
+            temperature=0
+        )
+    elif model_type == "glm4":
+        # GLM4-Flash模型配置
+        glm4_api_key = os.getenv("glm4_AI_KEY")
+        
+        if not glm4_api_key:
+            raise ValueError("必须在 .env 文件中设置 glm4_AI_KEY。")
+            
+        return ChatOpenAI(
+            temperature=0,
+            model="GLM-4-Flash-250414",
+            openai_api_key=glm4_api_key,
+            openai_api_base="https://open.bigmodel.cn/api/paas/v4/"
+        )
+    else:
+        raise ValueError(f"不支持的模型类型: {model_type}")
 
 # --- 数据库设置 ---
 def setup_database(db_file=DB_FILE, verbose=False):
@@ -137,6 +164,11 @@ SQL_GENERATION_PROMPT = f"""你是一个 SQL 专家。根据用户的问题生�
 用户问题: {{question}}
 
 {SQL_BASE_GUIDELINES}
+1. 车型名必须带品牌前缀，如 `"蔚来ET7"` 而非 `"ET7"`
+2. 查询车型时必须使用模糊匹配：`"车型" LIKE '%蔚来ES6%'`
+3. 当需要精确匹配时，可以结合品牌条件，如 `"品牌" = '蔚来' AND "车型" LIKE '%ES6%'`
+4. 对于可能有多个版本的车型，模糊匹配可以获取所有相关版本
+5. 销量数据可能存储在"量"列中，而不是"销量"列
 
 只返回 SQL 查询语句，不要有任何其他解释或格式标记。
 """
@@ -152,8 +184,9 @@ SQL 查询: {sql_query}
 
 # 节点函数
 def identify_intent(state: AgentState) -> AgentState:
-    """识别用户意图"""
-    llm = get_llm()
+    """识别用户意图，使用GLM4-Flash模型"""
+    # 使用GLM4模型
+    llm = get_llm("glm4")
     
     intent_chain = ChatPromptTemplate.from_template(INTENT_RECOGNITION_PROMPT) | llm | StrOutputParser()
     
@@ -195,40 +228,11 @@ def get_database_schema(state: AgentState) -> AgentState:
     }
 
 def generate_sql_query(state: AgentState) -> AgentState:
-    """生成 SQL 查询"""
-    llm = get_llm()
+    """生成 SQL 查询，使用DeepSeek模型"""
+    # 明确指定使用DeepSeek模型
+    llm = get_llm("deepseek")
     
-    # 获取表结构信息
-    global _TABLE_STRUCTURE
-    
-    # 格式化表结构信息
-    table_structure_text = format_table_structure(_TABLE_STRUCTURE)
-    
-    # 构建增强提示
-    enhanced_prompt = f"""你是一个 SQL 专家。根据用户的问题生成适当的 SQL 查询。
-
-    数据库是 DuckDB，它与 PostgreSQL 语法兼容，但有一些特殊功能。
-
-    数据库结构信息:
-    {state.get("schema", "")}
-
-    详细的表结构信息:
-    {table_structure_text}
-
-    用户问题: {state["question"]}
-
-    {SQL_BASE_GUIDELINES}
-
-    1. 车型名必须带品牌前缀，如 `"蔚来ET7"` 而非 `"ET7"`
-    2. 查询车型时必须使用模糊匹配：`"车型" LIKE '%蔚来ES6%'`
-    3. 当需要精确匹配时，可以结合品牌条件，如 `"品牌" = '蔚来' AND "车型" LIKE '%ES6%'`
-    4. 对于可能有多个版本的车型，模糊匹配可以获取所有相关版本
-    5. 销量数据可能存储在"量"列中，而不是"销量"列
-
-    只返回 SQL 查询语句，不要有任何其他解释或格式标记。
-    """
-    
-    sql_chain = ChatPromptTemplate.from_template(enhanced_prompt) | llm | StrOutputParser()
+    sql_chain = ChatPromptTemplate.from_template(SQL_GENERATION_PROMPT) | llm | StrOutputParser()
     
     raw_sql_query = sql_chain.invoke({
         "schema": state.get("schema", ""),
@@ -255,8 +259,9 @@ def generate_sql_query(state: AgentState) -> AgentState:
     }
 
 def validate_sql_query(state: AgentState) -> AgentState:
-    """验证 SQL 查询"""
-    llm = get_llm()
+    """验证 SQL 查询，使用DeepSeek模型"""
+    # 明确指定使用DeepSeek模型
+    llm = get_llm("deepseek")
     
     # 获取数据库中实际存在的表名列表和列名信息
     db = get_db_connection()
@@ -505,8 +510,9 @@ def execute_sql_query(state: AgentState) -> AgentState:
         }
 
 def generate_answer(state: AgentState) -> AgentState:
-    """生成最终回答"""
-    llm = get_llm()
+    """生成最终回答，使用GLM4-Flash模型"""
+    # 使用GLM4模型
+    llm = get_llm("glm4")
     
     # 如果有错误，直接返回错误信息
     if state.get("error"):
@@ -533,16 +539,60 @@ def generate_answer(state: AgentState) -> AgentState:
     }
 
 def direct_schema_response(state: AgentState) -> AgentState:
-    """直接返回数据库模式信息"""
+    """直接返回数据库模式信息，使用GLM4-Flash模型，并能回答关于表结构的问题"""
+    # 使用GLM4模型
+    llm = get_llm("glm4")
+    
     # 使用连接池而不是创建新连接
     db = get_db_connection()
     
+    # 获取数据库模式信息
     schema = db.get_table_info()
     
-    answer = f"以下是数据库的表结构信息:\n\n{schema}"
+    # 获取全局表结构信息
+    global _TABLE_STRUCTURE
+    if not _TABLE_STRUCTURE:
+        _TABLE_STRUCTURE = analyze_database_structure()
+    
+    # 格式化表结构信息为易读文本
+    table_structure_text = format_table_structure(_TABLE_STRUCTURE)
+    
+    # 检查用户问题是否针对特定表
+    user_question = state["question"]
+    specific_table_info = ""
+    
+    # 检查用户是否询问特定表的信息
+    for table_name in _TABLE_STRUCTURE.keys():
+        if table_name.lower() in user_question.lower():
+            specific_table_info = f"关于表 \"{table_name}\" 的详细信息:\n"
+            specific_table_info += f"列数: {len(_TABLE_STRUCTURE[table_name])}\n"
+            specific_table_info += "列名和类型:\n"
+            for col in _TABLE_STRUCTURE[table_name]:
+                specific_table_info += f"  - \"{col['name']}\" ({col['type']})\n"
+            break
+    
+    # 使用GLM4模型生成更友好的模式描述
+    schema_prompt = f"""你是一个数据库专家。请根据以下数据库模式信息和表结构详情，回答用户的问题。
+
+    用户问题: {user_question}
+    
+    数据库模式信息:
+    {schema}
+    
+    表结构详细信息:
+    {table_structure_text}
+    
+    {specific_table_info if specific_table_info else ""}
+    
+    请提供一个友好的回答，避免技术术语，除非必要。如果用户询问特定表的信息，请重点介绍该表的结构和用途。
+    如果用户询问的表不存在，请告知用户并列出可用的表。"""
+    
+    schema_chain = ChatPromptTemplate.from_template(schema_prompt) | llm | StrOutputParser()
+    
+    answer = schema_chain.invoke({}).strip()
     
     thoughts = state.get("thoughts", [])
-    thoughts.append("直接返回数据库模式信息")
+    thoughts.append("使用GLM4生成了数据库模式描述并回答了关于表结构的问题")
     
     return {
         **state,
@@ -712,7 +762,6 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     chat_interface = gr.ChatInterface(
         fn=query_agent,
         examples=[ 
-            "描述数据库中的表",
             "数据库中有哪些表？",
             '显示"上险数_03_data_截止 202504_clean"表中的前5条记录',
             "智己2024年销量如何？",
