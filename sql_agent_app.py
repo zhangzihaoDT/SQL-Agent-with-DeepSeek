@@ -118,29 +118,50 @@ def setup_database(db_file=DB_FILE, verbose=False):
 
 # 定义 Agent 状态类型
 class AgentState(TypedDict):
-    question: str  # 用户提出的问题
-    thoughts: List[str]  # Agent 的思考过程
-    intent: Optional[str]  # 用户意图
-    sql_query: Optional[str]  # 生成的 SQL 查询
-    sql_result: Optional[str]  # SQL 查询结果
-    answer: Optional[str]  # 最终回答
-    conversation_history: List[Dict[str, str]]  # 对话历史
-    error: Optional[str]  # 错误信息
+    question: str
+    thoughts: List[str]
+    intent: Optional[str]
+    schema: Optional[str]
+    complexity: Optional[str]  # 新增：复杂度评估
+    strategy: Optional[str]    # 新增：处理策略
+    planning_output: Optional[str]
+    sql_query: Optional[str]
+    sql_result: Optional[str]
+    answer: Optional[str]
+    conversation_history: List[Dict[str, str]]
+    error: Optional[str]
 
 # 提示模板
-INTENT_RECOGNITION_PROMPT = """你是一个专业的数据库分析助手。请分析用户的问题，识别其意图。
+# 智能路由：合并的提示模板，一次性完成多个判断
+intelligent_routing_prompt = """你是一个专业的数据库分析助手和查询规划师。请分析用户的问题，完成以下三个任务：
 
 用户问题: {question}
+数据库Schema: {schema}
 
+请按以下格式输出你的分析结果：
+
+**1. 意图识别:**
 请确定用户是想要:
-1. 获取表结构信息
-2. 执行特定的 SQL 查询
-3. 获取有关数据的一般信息
-
-请只返回以下选项之一:
 - GET_SCHEMA: 用户想了解数据库结构
 - EXECUTE_QUERY: 用户想执行查询
 - GET_INFO: 用户想获取一般信息
+
+**2. 复杂度评估:**
+分析问题复杂度（简单/中等/复杂）：
+- 简单：单表查询，基本条件筛选
+- 中等：涉及聚合、排序、简单计算
+- 复杂：多表关联、复杂分析、对比研究
+
+**3. 处理策略:**
+基于以上分析，建议的处理路径：
+- DIRECT_SCHEMA: 直接返回表结构信息
+- SIMPLE_QUERY: 直接生成SQL，无需详细规划
+- COMPLEX_QUERY: 需要详细规划后再生成SQL
+
+**4. 规划输出:**
+如果是复杂查询，请提供简要的查询规划；如果是简单查询，说明"无需详细规划"。
+
+请严格按照上述格式输出，每个部分用一行简洁的文字说明。
 """
 
 # 共享提示片段
@@ -154,55 +175,74 @@ SQL_BASE_GUIDELINES = """
 """
 
 # 更新SQL_GENERATION_PROMPT
-SQL_GENERATION_PROMPT = f"""你是一个 SQL 专家。根据用户的问题生成适当的 SQL 查询。
+SQL_GENERATION_PROMPT = f"""你是一个 SQL 专家。根据用户的问题和提供的查询计划，生成适当的 SQL 查询。
 
 数据库是 DuckDB，它与 PostgreSQL 语法兼容，但有一些特殊功能。
+
+你可以一步一步来分析需求，最终确定需要生成的查询SQL。
 
 数据库结构信息:
 {{schema}}
 
 用户问题: {{question}}
 
+查询规划:
+{{planning_output}}
+
 {SQL_BASE_GUIDELINES}
-1. 车型名必须带品牌前缀，如 `"蔚来ET7"` 而非 `"ET7"`
-2. 查询车型时必须使用模糊匹配：`"车型" LIKE '%蔚来ES6%'`
-3. 当需要精确匹配时，可以结合品牌条件，如 `"品牌" = '蔚来' AND "车型" LIKE '%ES6%'`
-4. 对于可能有多个版本的车型，模糊匹配可以获取所有相关版本
-5. 销量数据可能存储在"量"列中，而不是"销量"列
+
+特定场景处理指南:
+1.  **车型名称处理**:
+    *   车型名必须带品牌前缀，例如 "蔚来ET7" 而非 "ET7"。
+    *   查询车型时必须使用模糊匹配：`"车型" LIKE '%蔚来ES6%'`。
+    *   当需要精确匹配时，可以结合品牌条件，例如 `"品牌" = '蔚来' AND "车型" LIKE '%ES6%'`。
+    *   对于可能有多个版本的车型，模糊匹配可以获取所有相关版本。
+
+2.  **百分比分布和聚合查询**:
+    *   如果用户问题涉及到计算不同类别（如年龄段、性别等）的百分比分布，特别是在对比多个实体（如不同车型）时，你需要生成能够直接在数据库层面完成聚合和百分比计算的SQL。
+    *   例如，如果问题是“对比A车型和B车型用户在不同年龄段的百分比分布”，并且数据库中年龄是具体数值，你需要：
+        a.  根据业务逻辑定义年龄段（例如：20-30岁, 31-40岁等），可以使用 `CASE WHEN ... THEN ... ELSE ... END` 语句创建临时的年龄段列。
+        b.  按车型和年龄段对用户数量进行分组计数 (`COUNT(*)` 或 `COUNT(DISTINCT user_id)`).
+        c.  计算每个年龄段在对应车型用户总数中的百分比。这通常涉及到子查询或窗口函数来获取每个车型的总用户数，然后计算 `(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY "车型"))`。
+    *   确保查询结果直接包含车型、年龄段以及对应的百分比，例如：`车型 | 年龄段 | 用户百分比`。
+
+3.  **多条SQL查询处理**:
+    *   如果查询规划中建议了多条SQL查询，并且规划明确指出需要多条，请只生成第一条建议的SQL查询。后续的查询将在其他步骤处理。
 
 只返回 SQL 查询语句，不要有任何其他解释或格式标记。
 """
 
-ANSWER_GENERATION_PROMPT = """你是一个数据库分析助手。根据 SQL 查询结果回答用户的问题。
+ANSWER_GENERATION_PROMPT = """你是一个高级数据分析师。根据 SQL 查询结果回答用户的问题。
 
 用户问题: {question}
 SQL 查询: {sql_query}
 查询结果: {sql_result}
 
-请提供一个清晰、简洁的回答，解释查询结果并回答用户的问题。使用友好的语气，避免技术术语，除非必要。
+**重要指令：**
+1. **严格基于查询结果**：你必须严格基于上面提供的 `查询结果` 来回答用户问题。绝对不要编造、推测或使用你的预训练知识来填充数据。
+
+2. **处理空结果**：
+   - 如果 `查询结果` 为空、显示"Empty DataFrame"、"no rows"或类似内容，请明确告知用户："根据您的查询条件，在数据库中未找到符合条件的数据。"
+   - 不要提供任何虚构的数据或示例。
+
+3. **数据准确性**：
+   - 如果查询结果包含具体数据，请准确引用其中的数值、名称和其他信息。
+   - 对于数值数据，请使用查询结果中的确切数字，不要四舍五入或估算。
+   - 对于列表或排名，请按查询结果中的确切顺序和内容呈现。
+
+4. **格式化输出**：
+   - 将查询结果转换为清晰、易读的自然语言描述。
+   - 使用友好的语气，但保持专业性。
+   - 避免过度的技术术语，除非用户明确需要。
+
+5. **结果验证**：
+   - 在回答之前，请仔细检查你的回答是否与 `查询结果` 中的信息完全一致。
+   - 如果查询结果的格式难以理解，请尽力解释，但不要添加不存在的信息。
+
+请基于以上指令，提供一个准确、清晰的回答。
 """
 
 # 节点函数
-def identify_intent(state: AgentState) -> AgentState:
-    """识别用户意图，使用GLM4-Flash模型"""
-    # 使用GLM4模型
-    llm = get_llm("glm4")
-    
-    intent_chain = ChatPromptTemplate.from_template(INTENT_RECOGNITION_PROMPT) | llm | StrOutputParser()
-    
-    intent = intent_chain.invoke({
-        "question": state["question"]
-    }).strip()
-    
-    thoughts = state.get("thoughts", [])
-    thoughts.append(f"识别的意图: {intent}")
-    
-    return {
-        **state,
-        "thoughts": thoughts,
-        "intent": intent
-    }
-
 def get_db_connection(verbose=False):
     """获取数据库连接（单例模式）"""
     global _DB_CONNECTION
@@ -227,6 +267,84 @@ def get_database_schema(state: AgentState) -> AgentState:
         "schema": schema
     }
 
+def intelligent_router(state: AgentState) -> AgentState:
+    """智能路由节点：同时完成意图识别、复杂度判断和规划决策"""
+    llm = get_llm("glm4")
+    
+    routing_chain = ChatPromptTemplate.from_template(intelligent_routing_prompt) | llm | StrOutputParser()
+    
+    routing_result = routing_chain.invoke({
+        "question": state["question"],
+        "schema": state.get("schema", "无法获取Schema信息")
+    }).strip()
+    
+    # 解析路由结果
+    intent = "EXECUTE_QUERY"  # 默认值
+    complexity = "simple"     # 默认值
+    strategy = "SIMPLE_QUERY" # 默认值
+    planning_output = "无需详细规划"
+    
+    try:
+        lines = routing_result.split('\n')
+        for line in lines:
+            if "意图识别" in line or "GET_SCHEMA" in line:
+                if "GET_SCHEMA" in line:
+                    intent = "GET_SCHEMA"
+                elif "EXECUTE_QUERY" in line:
+                    intent = "EXECUTE_QUERY"
+                elif "GET_INFO" in line:
+                    intent = "GET_INFO"
+            
+            elif "处理策略" in line or "DIRECT_SCHEMA" in line or "SIMPLE_QUERY" in line or "COMPLEX_QUERY" in line:
+                if "DIRECT_SCHEMA" in line:
+                    strategy = "DIRECT_SCHEMA"
+                elif "COMPLEX_QUERY" in line:
+                    strategy = "COMPLEX_QUERY"
+                elif "SIMPLE_QUERY" in line:
+                    strategy = "SIMPLE_QUERY"
+            
+            elif "复杂度评估" in line:
+                if "复杂" in line:
+                    complexity = "complex"
+                elif "中等" in line:
+                    complexity = "medium"
+                else:
+                    complexity = "simple"
+        
+        # 提取规划输出
+        if "规划输出" in routing_result:
+            planning_section = routing_result.split("规划输出:")[1].strip()
+            if planning_section and "无需详细规划" not in planning_section:
+                planning_output = planning_section
+    
+    except Exception as e:
+        print(f"解析路由结果时出错: {e}")
+        # 使用默认值
+    
+    thoughts = state.get("thoughts", [])
+    thoughts.append(f"智能路由分析 - 意图: {intent}, 复杂度: {complexity}, 策略: {strategy}")
+    thoughts.append(f"路由详细结果: {routing_result}")
+    
+    return {
+        **state,
+        "thoughts": thoughts,
+        "intent": intent,
+        "complexity": complexity,
+        "strategy": strategy,
+        "planning_output": planning_output
+    }
+
+def route_by_strategy(state: AgentState) -> str:
+    """根据智能路由的策略决定下一步"""
+    strategy = state.get("strategy", "SIMPLE_QUERY")
+    
+    if strategy == "DIRECT_SCHEMA":
+        return "direct_schema"
+    elif strategy == "COMPLEX_QUERY":
+        return "generate_sql"  # 复杂查询直接生成SQL，因为已经有了规划
+    else:  # SIMPLE_QUERY
+        return "generate_sql"  # 简单查询直接生成SQL
+    
 def generate_sql_query(state: AgentState) -> AgentState:
     """生成 SQL 查询，使用DeepSeek模型"""
     # 明确指定使用DeepSeek模型
@@ -235,8 +353,9 @@ def generate_sql_query(state: AgentState) -> AgentState:
     sql_chain = ChatPromptTemplate.from_template(SQL_GENERATION_PROMPT) | llm | StrOutputParser()
     
     raw_sql_query = sql_chain.invoke({
-        "schema": state.get("schema", ""),
-        "question": state["question"]
+        "schema": state.get("schema", "无法获取Schema信息"),
+        "question": state["question"],
+        "planning_output": state.get("planning_output", "无规划信息") # 传递规划输出
     }).strip()
     
     # 清理 SQL 查询，移除可能的 Markdown 代码块标记
@@ -259,37 +378,27 @@ def generate_sql_query(state: AgentState) -> AgentState:
     }
 
 def validate_sql_query(state: AgentState) -> AgentState:
-    """验证 SQL 查询，使用DeepSeek模型"""
-    # 明确指定使用DeepSeek模型
+    """验证和修复 SQL 查询 - 使用缓存的表结构"""
     llm = get_llm("deepseek")
-    
-    # 获取数据库中实际存在的表名列表和列名信息
     db = get_db_connection()
-    actual_tables = db.get_usable_table_names()
     
-    # 获取每个表的列信息
+    # 确保表结构已缓存
+    global _TABLE_STRUCTURE
+    if not _TABLE_STRUCTURE:
+        _TABLE_STRUCTURE = analyze_database_structure(verbose=True)
+    
+    # 获取实际存在的表名
+    actual_tables = list(_TABLE_STRUCTURE.keys())
+    
+    # 直接从缓存中获取列信息，无需查询数据库
     table_columns = {}
     for table in actual_tables:
-        try:
-            # 使用全局表结构信息
-            global _TABLE_STRUCTURE
-            if table in _TABLE_STRUCTURE:
-                table_columns[table] = [col["name"] for col in _TABLE_STRUCTURE[table]]
-            else:
-                # 如果全局表结构中没有，尝试直接查询
-                columns_query = f'DESCRIBE "{table}"'
-                columns_result = db.run(columns_query)
-                # 提取列名
-                column_names = []
-                for line in columns_result.strip().split('\n'):
-                    if line and '|' in line:
-                        # 第一列通常是列名
-                        column_name = line.split('|')[0].strip()
-                        if column_name and column_name != "column_name" and not column_name.startswith('-'):
-                            column_names.append(column_name)
-                table_columns[table] = column_names
-        except Exception as e:
-            print(f"获取表 {table} 的列信息时出错: {e}")
+        if table in _TABLE_STRUCTURE:
+            table_columns[table] = [col["name"] for col in _TABLE_STRUCTURE[table]]
+        else:
+            # 这种情况理论上不应该发生，因为我们已经完整缓存了
+            print(f"警告: 表 '{table}' 不在缓存中，这可能表示缓存不完整")
+            table_columns[table] = []
     
     validation_prompt = """你是一个 SQL 专家。请验证以下 SQL 查询是否有效，并修复任何问题。
 
@@ -362,44 +471,70 @@ def validate_sql_query(state: AgentState) -> AgentState:
             "sql_query": state.get("sql_query", "")
         }
 
-# 创建 SQL Agent
+# 添加缓存状态监控函数
+def get_cache_status():
+    """获取表结构缓存状态"""
+    global _TABLE_STRUCTURE
+    if not _TABLE_STRUCTURE:
+        return {
+            "cached": False,
+            "table_count": 0,
+            "total_columns": 0
+        }
+    
+    total_columns = sum(len(columns) for columns in _TABLE_STRUCTURE.values())
+    return {
+        "cached": True,
+        "table_count": len(_TABLE_STRUCTURE),
+        "total_columns": total_columns,
+        "tables": list(_TABLE_STRUCTURE.keys())
+    }
+
+def refresh_table_structure_cache(verbose=False):
+    """强制刷新表结构缓存"""
+    global _TABLE_STRUCTURE
+    _TABLE_STRUCTURE = {}
+    return analyze_database_structure(verbose=verbose)
+
+
+# 修改 create_sql_agent 函数
 def create_sql_agent():
-    """创建 SQL Agent 工作流"""
-    # 创建状态图
+    """创建优化后的 SQL Agent 工作流"""
     workflow = StateGraph(AgentState)
     
     # 添加节点
-    workflow.add_node("identify_intent", identify_intent)
     workflow.add_node("get_schema", get_database_schema)
+    workflow.add_node("intelligent_router", intelligent_router)  # 新的智能路由节点
     workflow.add_node("generate_sql", generate_sql_query)
-    workflow.add_node("validate_sql", validate_sql_query)  # 新增验证节点
+    workflow.add_node("validate_sql", validate_sql_query)
     workflow.add_node("execute_sql", execute_sql_query)
     workflow.add_node("generate_answer", generate_answer)
     workflow.add_node("direct_schema", direct_schema_response)
     
     # 设置入口点
-    workflow.set_entry_point("identify_intent")
+    workflow.set_entry_point("get_schema")
     
-    # 添加边
+    # 简化的边连接
+    workflow.add_edge("get_schema", "intelligent_router")
+    
+    # 根据智能路由的策略进行条件路由
     workflow.add_conditional_edges(
-        "identify_intent",
-        route_by_intent,
+        "intelligent_router",
+        route_by_strategy,
         {
             "direct_schema": "direct_schema",
-            "query_flow": "get_schema"
+            "generate_sql": "generate_sql"
         }
     )
     
-    workflow.add_edge("get_schema", "generate_sql")
-    workflow.add_edge("generate_sql", "validate_sql")  # 添加到验证节点的边
-    workflow.add_edge("validate_sql", "execute_sql")   # 从验证节点到执行节点的边
+    workflow.add_edge("generate_sql", "validate_sql")
+    workflow.add_edge("validate_sql", "execute_sql")
     workflow.add_edge("execute_sql", "generate_answer")
     
-    # 设置终止节点
-    workflow.add_edge("direct_schema", END)
+    # 设置结束点
     workflow.add_edge("generate_answer", END)
+    workflow.add_edge("direct_schema", END)
     
-    # 编译工作流
     return workflow.compile()
 
 def execute_sql_query(state: AgentState) -> AgentState:
@@ -428,7 +563,12 @@ def execute_sql_query(state: AgentState) -> AgentState:
         # 执行查询
         sql_result = db.run(sql_query)
         
-        thoughts.append("成功执行 SQL 查询")
+        # 检查查询结果是否为空，并提供明确的标识
+        if not sql_result or sql_result.strip() == "" or "Empty DataFrame" in str(sql_result) or sql_result.strip() == "[]":
+            sql_result = "[查询执行成功，但未找到符合条件的数据记录]"
+            thoughts.append("SQL 查询执行成功，但返回空结果")
+        else:
+            thoughts.append("成功执行 SQL 查询")
         
         return {
             **state,
@@ -514,11 +654,28 @@ def generate_answer(state: AgentState) -> AgentState:
     # 使用GLM4模型
     llm = get_llm("glm4")
     
-    # 如果有错误，直接返回错误信息
+    # 如果有错误，让LLM解释错误信息
     if state.get("error"):
+        error_message = state["error"]
+        error_explanation_prompt = f"""你是一个乐于助人的AI助手。用户在尝试执行SQL查询时遇到了以下错误：
+
+        错误信息：
+        {error_message}
+
+        请简短，解释这个错误，并尽可能提供一些建议来帮助用户解决问题。
+"""
+        
+        explanation_chain = ChatPromptTemplate.from_template(error_explanation_prompt) | llm | StrOutputParser()
+        
+        explained_error = explanation_chain.invoke({}).strip()
+        
+        thoughts = state.get("thoughts", [])
+        thoughts.append(f"LLM解释了SQL执行错误: {error_message}")
+        
         return {
             **state,
-            "answer": f"抱歉，我在执行查询时遇到了问题: {state['error']}"
+            "thoughts": thoughts,
+            "answer": explained_error
         }
     
     answer_chain = ChatPromptTemplate.from_template(ANSWER_GENERATION_PROMPT) | llm | StrOutputParser()
@@ -600,57 +757,81 @@ def direct_schema_response(state: AgentState) -> AgentState:
         "answer": answer
     }
 
-def route_by_intent(state: AgentState) -> str:
-    """根据意图路由到不同的节点"""
-    intent = state.get("intent", "")
-    
-    if intent == "GET_SCHEMA":
-        return "direct_schema"
-    elif intent == "EXECUTE_QUERY":
-        return "query_flow"
-    else:  # GET_INFO 或其他
-        return "query_flow"  # 默认走查询流程
-
 def analyze_database_structure(verbose=False):
-    """分析数据库结构，提取表和列信息"""
+    """分析数据库结构，提取表和列信息 - 启动时完整缓存版本"""
     global _TABLE_STRUCTURE
     
     if _TABLE_STRUCTURE:
+        if verbose:
+            print(f"使用已缓存的表结构信息，包含 {len(_TABLE_STRUCTURE)} 个表")
         return _TABLE_STRUCTURE
+    
+    if verbose:
+        print("开始分析数据库结构并建立完整缓存...")
     
     db = get_db_connection(verbose)
     tables = db.get_usable_table_names()
     _TABLE_STRUCTURE = {}
     
-    # 直接使用 SQLAlchemy 的反射功能获取表结构
+    # 使用 SQLAlchemy 的反射功能批量获取所有表结构
     engine = db._engine
     inspector = sqlalchemy.inspect(engine)
+    
+    successful_tables = 0
+    failed_tables = []
     
     for table in tables:
         try:
             columns = inspector.get_columns(table)
-            _TABLE_STRUCTURE[table] = [{"name": col["name"], "type": str(col["type"])} for col in columns]
+            _TABLE_STRUCTURE[table] = [
+                {"name": col["name"], "type": str(col["type"])} 
+                for col in columns
+            ]
+            successful_tables += 1
             
             if verbose:
-                print(f"分析表 '{table}': 找到 {len(_TABLE_STRUCTURE[table])} 列")
-                if _TABLE_STRUCTURE[table]:
-                    print(f"列名示例: {', '.join([col['name'] for col in _TABLE_STRUCTURE[table][:3]])}")
+                print(f"✓ 表 '{table}': {len(_TABLE_STRUCTURE[table])} 列")
+                
         except Exception as e:
+            failed_tables.append((table, str(e)))
             if verbose:
-                print(f"分析表 '{table}' 结构时出错: {str(e)}")
+                print(f"✗ 表 '{table}' 分析失败: {str(e)}")
+    
+    if verbose:
+        print(f"\n数据库结构分析完成:")
+        print(f"  - 成功分析: {successful_tables} 个表")
+        print(f"  - 失败: {len(failed_tables)} 个表")
+        if failed_tables:
+            print(f"  - 失败的表: {[table for table, _ in failed_tables]}")
     
     return _TABLE_STRUCTURE
 
-# 在 Agent 初始化时调用
+# 在 Agent 初始化时调用 - 更新版本
 try:
-    # 分析数据库结构
-    table_structure = analyze_database_structure(verbose=True)
-    print(f"成功分析了 {len(table_structure)} 个表的结构")
+    print("正在初始化 SQL Agent...")
     
+    # 预先分析并缓存所有数据库结构
+    print("步骤 1: 分析数据库结构并建立缓存...")
+    table_structure = analyze_database_structure(verbose=True)
+    
+    if table_structure:
+        cache_status = get_cache_status()
+        print(f"✓ 表结构缓存建立成功:")
+        print(f"  - 缓存表数量: {cache_status['table_count']}")
+        print(f"  - 总列数: {cache_status['total_columns']}")
+        print(f"  - 表列表: {', '.join(cache_status['tables'][:5])}{'...' if len(cache_status['tables']) > 5 else ''}")
+    else:
+        print("⚠️  警告: 未能缓存任何表结构")
+    
+    # 创建 Agent
+    print("步骤 2: 创建 LangGraph Agent...")
     agent_executor = create_sql_agent()
-    print("SQL Agent 使用 LangGraph 初始化成功。")
+    print("✓ SQL Agent 使用 LangGraph 初始化成功")
+    
 except Exception as e:
-    print(f"初始化期间出错: {e}")
+    print(f"❌ 初始化期间出错: {e}")
+    import traceback
+    traceback.print_exc()
     agent_executor = None
     table_structure = {}
 
@@ -747,7 +928,7 @@ def query_agent(message: str, history: list):
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown(
             """
-            # SQL 查询助手 (基于 LangGraph 和 DeepSeek)
+            # 市场分析AI助手
             使用 LangGraph 构建的代理，结合 DeepSeek 和 GLM-4 模型，通过自然语言与 DuckDB 数据库进行交互。
             """
         )
@@ -782,9 +963,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 "新能源市场月度渗透率走势",
                 "2024年不同燃料类型车型数量是多少？",
                 "2024年不同燃料类型车型数量是多少？从价格配置表中查询。",
-                "在价格配置表中找出2024年20-25万增程（REEV）suv销量前十车型",
+                "在价格配置表中找出2024年20到25万增程（REEV）suv销量前十车型",
                 "2024年哪个城市级别的销量最高？",
-                "对比蔚来ET5 和智己L6用户年龄百分比分布",
+                "对比小米SU7和智己L6用户年龄百分比分布差异",
             ],
             chatbot=gr.Chatbot(height=450, show_copy_button=True), 
             textbox=gr.Textbox(placeholder="请输入您关于数据库的问题...", container=False, scale=7),
