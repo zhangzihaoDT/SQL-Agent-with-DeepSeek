@@ -1,0 +1,3 @@
+nohup: ignoring input
+/home/devbox/project/SQL-Agent-with-DeepSeek/venv/lib/python3.11/site-packages/duckdb_engine/__init__.py:184: DuckDBEngineWarning: duckdb-engine doesn't yet support reflection on indices
+  warnings.warn(

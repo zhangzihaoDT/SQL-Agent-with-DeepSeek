@@ -27,9 +27,9 @@ from langchain_core.runnables import RunnablePassthrough
 from langgraph.graph import StateGraph, END
 
 # --- 配置 ---
-ENV_PATH = "/Users/zihao_/Documents/coding/Langchain_chatwithdata/W20方向/.env"
+ENV_PATH = ".env"
 # 更新数据库文件路径
-DB_FILE = "/Users/zihao_/Documents/coding/Langchain_chatwithdata/database/central_analytics.duckdb"
+DB_FILE = "./data/central_analytics.duckdb"
 
 # --- 初始化 Agent ---
 # 全局变量存储表结构信息
@@ -976,4 +976,4 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     print(f"尝试启动 Gradio 界面...")
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=8080)
